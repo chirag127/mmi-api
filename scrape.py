@@ -1,16 +1,14 @@
 import requests
-import json
 import os
-import pandas as pd
-import matplotlib.pyplot as plt
+import json
 from datetime import datetime
-import matplotlib.dates as mdates
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # Configuration
 API_URL = "https://api.tickertape.in/mmi/now"
 DATA_DIR = "data"
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
-CHART_FILE = "mmi_chart.png"
 README_FILE = "README.md"
 
 # Headers and Cookies from the user request
@@ -35,6 +33,32 @@ COOKIES = {
     "AMP_d9d4ec74fa": "JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIwZGExNDExZS02MTk1LTQ5OTAtOGIzYy03MGEwNjNmYmMwMWElMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzcxMjU0NjgxNTEyJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTc3MTI1NTY0MTI1NiUyQyUyMmxhc3RFdmVudElkJTIyJTNBNDI3JTdE"
 }
 
+# Initialize Firebase Admin
+def initialize_firebase():
+    """Initialize Firebase Admin SDK with service account"""
+    try:
+        # Try to get the service account key from environment variable
+        service_account_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON')
+        if service_account_json:
+            # Parse the JSON string from environment variable
+            service_account_info = json.loads(service_account_json)
+            cred = credentials.Certificate(service_account_info)
+        else:
+            # Fallback to local file (for local development)
+            cred_path = os.path.join(os.environ.get('USERPROFILE', ''), 'firebase-keys', 'tickertape-mmi-mmi-scraper-key.json')
+            if os.path.exists(cred_path):
+                cred = credentials.Certificate(cred_path)
+            else:
+                print("ERROR: Firebase service account not found. Set FIREBASE_SERVICE_ACCOUNT_JSON env var or place key in ~/firebase-keys/")
+                return False
+        
+        firebase_admin.initialize_app(cred)
+        print("Firebase Admin initialized successfully")
+        return True
+    except Exception as e:
+        print(f"Error initializing Firebase: {e}")
+        return False
+
 def fetch_mmi_data():
     """Fetches the current MMI data from Ticker Tape API."""
     try:
@@ -52,23 +76,66 @@ def fetch_mmi_data():
 
 def get_mood_label(mmi_value):
     """Returns the mood label based on MMI value."""
-    # MMI Zones:
-    # Extreme Fear: < 30
-    # Fear: 30 - 50
-    # Greed: 50 - 70
-    # Extreme Greed: > 70
-    # (Approximate values based on common knowledge of MMI, adjusting if strict mapping needed)
-    if mmi_value < 30:
+    # MMI Zones based on user preference: Emerald→Rose gradient
+    # Extreme Fear: < 25 (Emerald/Green)
+    # Fear: 25 - 50 (Lime/Green-Yellow)
+    # Greed: 50 - 75 (Amber/Yellow-Orange)
+    # Extreme Greed: > 75 (Rose/Red-Pink)
+    if mmi_value < 25:
         return "Extreme Fear"
     elif mmi_value < 50:
         return "Fear"
-    elif mmi_value < 70:
+    elif mmi_value < 75:
         return "Greed"
     else:
         return "Extreme Greed"
 
-def update_history(current_data):
-    """Updates the history.json file with the new data point."""
+def get_zone_color(mood):
+    """Returns the color for each mood zone for dashboard use"""
+    colors = {
+        "Extreme Fear": "#10B981",  // Emerald
+        "Fear": "#84CC16",     // Lime
+        "Greed": "#F59E0B",    // Amber
+        "Extreme Greed": "#F43F5E"  // Rose
+    }
+    return colors.get(mood, "#6B7280")  // Default to gray
+
+def write_to_firestore(data):
+    """Write MMI data to Firestore"""
+    try:
+        db = firestore.client()
+        
+        # Prepare document data
+        timestamp_str = data.get("date")
+        value = data.get("currentValue")
+        
+        doc_data = {
+            "timestamp": firestore.SERVER_TIMESTAMP,  // Server timestamp for when written
+            "value": value,
+            "mood": get_mood_label(value),
+            "nifty": data.get("nifty"),
+            "fma": data.get("fma"),
+            "sma": data.get("sma"),
+            "createdAt": firestore.SERVER_TIMESTAMP
+        }
+        
+        # Use the API timestamp as document ID for idempotency
+        doc_id = timestamp_str.replace(":", "-").replace(".", "-")  // Make Firestore-safe ID
+        
+        # Write to mmi_readings collection
+        db.collection("mmi_readings").document(doc_id).set(doc_data)
+        
+        # Also update the latest reading in mmi_meta collection for fast dashboard access
+        db.collection("mmi_meta").document("latest").set(doc_data, merge=True)
+        
+        print(f"Successfully wrote MMI data to Firestore: {value} ({get_mood_label(value)})")
+        return True
+    except Exception as e:
+        print(f"Error writing to Firestore: {e}")
+        return False
+
+def update_history_file(data):
+    """Keep a local copy of history.json for migration/backup purposes (optional)"""
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
@@ -81,128 +148,33 @@ def update_history(current_data):
             print("Error reading history.json, starting with empty list.")
 
     # Extract relevant data
-    # The API returns 'date' in the 'daily' array or 'date' field.
-    # We use the 'date' from the data object which seems to be the update time.
-    timestamp = current_data.get("date")
-    value = current_data.get("currentValue")
-
-    # Check if we already have this timestamp to avoid duplicates (optional but good)
-    # Simple check: if last entry has same timestamp, skip or update.
-    # The user wants hourly runs, so exact timestamp might differ slightly if it's capture time vs data time.
-    # "date": "2026-02-16T14:20:00.086Z" <- this looks like data update time.
-    # If the API doesn't update, we might get duplicate entries for the same data time.
-    # Let's append anyway, or check the last entry's "date" field from the data.
+    timestamp = data.get("date")
+    value = data.get("currentValue")
 
     new_entry = {
         "timestamp": timestamp,
         "value": value,
         "mood": get_mood_label(value),
-        "raw_data": { # Optional: store some other fields if useful
-            "nifty": current_data.get("nifty"),
-            "fma": current_data.get("fma"),
-            "sma": current_data.get("sma")
+        "raw_data": {  // Optional: store some other fields if useful
+            "nifty": data.get("nifty"),
+            "fma": data.get("fma"),
+            "sma": data.get("sma")
         }
     }
 
     # Avoid duplicate data points based on timestamp from source
     if history and history[-1]["timestamp"] == timestamp:
-        print("Data for this timestamp already exists. Skipping append.")
+        print("Data for this timestamp already exists in history.json. Skipping append.")
     else:
         history.append(new_entry)
         with open(HISTORY_FILE, "w") as f:
             json.dump(history, f, indent=4)
-        print(f"Appended new data point: {value} ({new_entry['mood']}) at {timestamp}")
+        print(f"Appended new data point to history.json: {value} ({new_entry['mood']}) at {timestamp}")
 
     return history
 
-def generate_chart(history):
-    """Generates a line chart for the last 180 days with Nifty overlay."""
-    if not history:
-        print("No history to plot.")
-        return
-
-    # Create DataFrame
-    data_list = []
-    for entry in history:
-        timestamp = entry.get('timestamp')
-        mmi_val = entry.get('value')
-
-        # Extract Nifty value safely
-        nifty_val = None
-        if 'raw_data' in entry and 'nifty' in entry['raw_data']:
-            nifty_val = entry['raw_data']['nifty']
-
-        data_list.append({
-            'timestamp': timestamp,
-            'mmi': mmi_val,
-            'nifty': nifty_val
-        })
-
-    df = pd.DataFrame(data_list)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-    # Filter last 180 days (6 months)
-    cutoff_date = pd.Timestamp.now(tz=df['timestamp'].dt.tz) - pd.Timedelta(days=180)
-    df = df[df['timestamp'] > cutoff_date]
-
-    if df.empty:
-        print("No data in the last 180 days to plot.")
-        return
-
-    # Sort by date to ensure line plot is correct
-    df = df.sort_values('timestamp')
-
-    # Create figure and primary axis (MMI)
-    fig, ax1 = plt.subplots(figsize=(10, 6))
-
-    # Plot MMI on ax1 (Left Axis)
-    color = 'purple'
-    ax1.set_xlabel('Date')
-    ax1.set_ylabel('MMI Value', color=color)
-    line1, = ax1.plot(df['timestamp'], df['mmi'], marker='o', linestyle='-', color=color, markersize=4, label='MMI')
-    ax1.tick_params(axis='y', labelcolor=color)
-    ax1.set_ylim(0, 100)
-    ax1.grid(True, linestyle='--', alpha=0.5)
-
-    # Add colored zones background to ax1
-    ax1.axhspan(0, 30, color='green', alpha=0.1, label='Extreme Fear')
-    ax1.axhspan(30, 50, color='lime', alpha=0.1, label='Fear')
-    ax1.axhspan(50, 70, color='orange', alpha=0.1, label='Greed')
-    ax1.axhspan(70, 100, color='red', alpha=0.1, label='Extreme Greed')
-
-    # Create secondary axis (Nifty) sharing the same x-axis
-    ax2 = ax1.twinx()
-    color = 'tab:blue'
-    ax2.set_ylabel('Nifty Index', color=color)
-    # Filter out None values for Nifty plotting
-    mask = df['nifty'].notna()
-    line2, = ax2.plot(df.loc[mask, 'timestamp'], df.loc[mask, 'nifty'], linestyle='--', color=color, alpha=0.7, label='Nifty')
-    ax2.tick_params(axis='y', labelcolor=color)
-
-    # Combine legends
-    # We want legends from both axes.
-    # Use lines from ax1 (only the MMI line, ignoring zones for cleaner legend?)
-    # or just let matplotlib handle it.
-    # To mimic previous simple legend + zones, we can just add a custom legend or handle it simply.
-
-    # Simple combined legend
-    lines = [line1, line2]
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc='upper left')
-
-    plt.title("Market Mood Index (MMI) vs Nifty - Last 6 Months")
-
-    # Format x-axis
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    fig.autofmt_xdate()
-
-    plt.tight_layout()
-    plt.savefig(CHART_FILE)
-    print(f"Chart saved to {CHART_FILE}")
-    plt.close()
-
-def update_readme(latest_entry):
-    """Updates the README.md with the latest MMI value and chart."""
+def update_readme_badge(latest_entry):
+    """Updates the README.md with just the latest MMI value and dashboard link (no chart)"""
     if not latest_entry:
         return
 
@@ -217,55 +189,75 @@ def update_readme(latest_entry):
     except:
         readable_time = timestamp
 
-    content = f"""# Ticker Tape MMI Git Scraper
+    # Get color for the mood
+    zone_color = get_zone_color(mood)
+    
+    content = f"""# Ticker Tape MMI Tracker
 
-![Ticker Tape MMI Logo](logo.png)
+[![MMI Value](https://img.shields.io/badge/MMI-{mmi_value:.2f}-{zone_color.replace('#', '%23')})](https://tickertape-mmi.vercel.app)
 
-A daily/hourly scraper for the Ticker Tape Market Mood Index (MMI).
-This repository automatically fetches the MMI value, stores the history, and generates a chart.
+A scraper for the Ticker Tape Market Mood Index (MMI) that stores data in Firebase Firestore.
+View the live dashboard: [https://tickertape-mmi.vercel.app](https://tickertape-mmi.vercel.app)
 
 ## Latest MMI Value
 
 **{mmi_value:.2f}** - **{mood}**
 <small>Last Updated: {readable_time}</small>
 
-## MMI Trend (Last 30 Days)
+## About
 
-![MMI Chart](mmi_chart.png)
+This repository contains a scraper that fetches the MMI value hourly and stores it in Firebase Firestore.
+The data is visualized in a live dashboard at [https://tickertape-mmi.vercel.app](https://tickertape-mmi.vercel.app).
 
-## Data
+## Data Access
 
-The historical data is available in [data/history.json](data/history.json).
+Historical data is available via Firebase Firestore. For direct JSON access, check the GitHub repository
+for migration scripts or contact the maintainer.
 
 ### Zones Reference
-- **Extreme Fear:** < 30
-- **Fear:** 30 - 50
-- **Greed:** 50 - 70
-- **Extreme Greed:** > 70
+- **Extreme Fear:** &lt; 25
+- **Fear:** 25 - 50
+- **Greed:** 50 - 75
+- **Extreme Greed:** &gt; 75
 
-## API Access
+## API Endpoint
 
-You can access the historical data via GitHub Pages:
-[https://chirag127.github.io/tickertape-mmi/data/history.json](https://chirag127.github.io/tickertape-mmi/data/history.json)
-
-Raw JSON File:
-[https://raw.githubusercontent.com/chirag127/tickertape-mmi/main/data/history.json](https://raw.githubusercontent.com/chirag127/tickertape-mmi/main/data/history.json)
+The dashboard fetches data from Firebase Firestore. No public API endpoint is maintained in this repo
+to avoid abuse, but the Firebase project is configured for secure access.
 """
 
     with open(README_FILE, "w") as f:
         f.write(content)
-    print("README.md updated.")
+    print("README.md updated with badge only.")
 
 def main():
-    print("Starting MMI Scraper...")
+    print("Starting MMI Scraper with Firestore integration...")
+    
+    # Initialize Firebase
+    if not initialize_firebase():
+        print("Failed to initialize Firebase. Exiting.")
+        return
+    
+    # Fetch data from API
     data = fetch_mmi_data()
-    if data:
-        history = update_history(data)
-        generate_chart(history)
-        if history:
-            update_readme(history[-1])
+    if not data:
+        print("Failed to fetch data from API. Exiting.")
+        return
+    
+    # Write to Firestore
+    if not write_to_firestore(data):
+        print("Failed to write to Firestore. Continuing...")
+    
+    # Keep local history file (optional, for backup/migration)
+    history = update_history_file(data)
+    
+    # Update README with just the badge (no chart)
+    if history:
+        update_readme_badge(history[-1])
     else:
-        print("Failed to fetch data, skipping update.")
+        update_readme_badge({"value": data.get("currentValue"), "mood": get_mood_label(data.get("currentValue")), "timestamp": data.get("date")})
+    
+    print("MMI Scraper completed successfully.")
 
 if __name__ == "__main__":
     main()

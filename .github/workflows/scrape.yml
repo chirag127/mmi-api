@@ -26,10 +26,13 @@ jobs:
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
     - name: Run scraper
+      env:
+        FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
       run: python scrape.py
 
-    - name: Commit and push changes
+    - name: Commit README changes (daily only)
+      if: github.event.schedule == '0 0 * * *' || github.event_name == 'workflow_dispatch'
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
-        commit_message: "Update MMI data and chart"
-        file_pattern: "data/history.json mmi_chart.png README.md"
+        commit_message: "Update MMI README badge"
+        file_pattern: "README.md"
